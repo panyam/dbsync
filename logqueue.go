@@ -36,7 +36,7 @@ func NewLogQueue(pgdb *PGDB, callback LogEventCallbackFunc) *LogQueue {
 		pgdb:                      pgdb,
 		TimerDelayBackoffFactor:   1.5,
 		DelayBetweenPeekRetries:   100 * time.Millisecond,
-		MaxDelayBetweenEmptyPeeks: 5 * time.Second,
+		MaxDelayBetweenEmptyPeeks: 60 * time.Second,
 	}
 	return out
 }
