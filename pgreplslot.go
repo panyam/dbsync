@@ -88,12 +88,13 @@ func PGReplSlotFromEnv() (p *PGReplSlot) {
 	}
 
 	// Create publications etc here otherwise Setup will fail
-	if err := p.Setup(db); err != nil {
+	if err := p.setup(db); err != nil {
 		panic(err)
 	}
 	return
 }
 
+// Returns the info about a table given its relation ID
 func (p *PGReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
 	if p.relnToPGTableInfo == nil {
 		p.relnToPGTableInfo = make(map[uint32]*PGTableInfo)
@@ -109,9 +110,7 @@ func (p *PGReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
 	return tableinfo
 }
 
-/**
- * Queries the DB for the latest schema of a given relation and stores it
- */
+// Queries the DB for the latest schema of a given relation and stores it
 func (p *PGReplSlot) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
 	field_info_query := fmt.Sprintf(`SELECT table_schema, table_name, column_name, ordinal_position, data_type, table_catalog from information_schema.columns WHERE table_schema = '%s' and table_name = '%s' ;`, namespace, table_name)
 	log.Println("Query for field types: ", field_info_query)
@@ -142,7 +141,8 @@ func (p *PGReplSlot) RefreshTableInfo(relationID uint32, namespace string, table
 	return
 }
 
-func (p *PGReplSlot) Setup(db *sql.DB) (err error) {
+// Sets up the replication slot with our auxiliary namespace, watermark table, publications and replication slots
+func (p *PGReplSlot) setup(db *sql.DB) (err error) {
 	p.db = db
 	err = p.ensureNamespace()
 
@@ -160,10 +160,13 @@ func (p *PGReplSlot) Setup(db *sql.DB) (err error) {
 	return
 }
 
+// Returns the underlying sql.DB instance being tracked
 func (p *PGReplSlot) DB() *sql.DB {
 	return p.db
 }
 
+// Returns numMessages number of events at the front of the replication slot (queue).  If consume parameter is set, then the offset
+// is automatically forwarded, otherwise repeated calls to this method will simply returned "peeked" messages.
 func (p *PGReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
 	msgs = out
 	changesfuncname := "pg_logical_slot_peek_binary_changes"
@@ -193,6 +196,7 @@ func (p *PGReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (ms
 	return
 }
 
+// Forwards the message offset on the replication slot.  Typically GetMessages is called to peek N messages.  Then after those messages are processed the offset is forwarded to ensure at-least once processing of messages.
 func (p *PGReplSlot) Forward(nummsgs int) error {
 	changesfuncname := "pg_logical_slot_get_binary_changes"
 	q := fmt.Sprintf(`select * from %s('%s', NULL, %d,

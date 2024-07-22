@@ -12,6 +12,10 @@ type cmd struct {
 	Data any
 }
 
+// Type of the callback function to handle messages read (peeked) from replication slot before the offset is forwarded.
+// The callback accepts the list of messages (at the head of the replication slot) and returns two outputs:
+//   - numProcessed - The number of messages processed.  The poller then forwards the slot's by this amount (instead of how many it originally peeked).
+//   - stop - A bool variable that signals to the poller if it should stop processing any further messages from the replication slot.
 type LogEventCallbackFunc func([]PGMSG, error) (numProcessed int, stop bool)
 
 // The PeriodicLogReader polls the postgres replication slot at periodic intervals
@@ -21,21 +25,32 @@ type LogEventCallbackFunc func([]PGMSG, error) (numProcessed int, stop bool)
 // change/write heavy system so that the poller can control how fast it consumes/processes
 // messages.
 type PGSlotPoller struct {
-	// How many items will be peeked at a time
+	// The callback to handle messages read (peeked) from replication slot before the offset is forwarded.
 	Callback LogEventCallbackFunc
+
+	// The poller peeks for messages in the replication slot periodically.
+	// This determines delay between peeks.
+	DelayBetweenPeekRetries time.Duration
+
+	// The delay between peeks is not fixed.  Instead if no messages are found a backoff is applied
+	// so this delay increases until there are more messages.  This factor determins how much the
+	// delay should be increased by when no messages are found on the slot.
+	TimerDelayBackoffFactor float32
+
+	// The delay between empty peeks is capped at this amount.
+	MaxDelayBetweenEmptyPeeks time.Duration
+
+	// Maximum number of messages to read and process at a time.
+	MaxMessagesToRead int
 
 	// A channel letting us know how many items are to be committed
 	commitReqChan chan int
 
 	pgrs *PGReplSlot
 
-	isRunning                 bool
-	cmdChan                   chan cmd
-	wg                        sync.WaitGroup
-	TimerDelayBackoffFactor   float32
-	DelayBetweenPeekRetries   time.Duration
-	MaxDelayBetweenEmptyPeeks time.Duration
-	MaxMessagesToRead         int
+	isRunning bool
+	cmdChan   chan cmd
+	wg        sync.WaitGroup
 }
 
 // Creates a new slot poller for a given postgres DB.
@@ -51,18 +66,18 @@ func NewPGSlotPoller(pgrs *PGReplSlot, callback LogEventCallbackFunc) *PGSlotPol
 	return out
 }
 
+// Tells if the poller is running or stopped.
 func (l *PGSlotPoller) IsRunning() bool {
 	return l.isRunning
 }
 
+// Signals to the poller to stop consuming messages from the replication slot
 func (l *PGSlotPoller) Stop() {
 	l.cmdChan <- cmd{Name: "stop"}
 	l.wg.Wait()
 }
 
-/**
- * Resume getting events.
- */
+// Starts the event polling loop
 func (l *PGSlotPoller) Start() {
 	l.isRunning = true
 	log.Println("Slot Poller Started")
