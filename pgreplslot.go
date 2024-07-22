@@ -10,24 +10,22 @@ import (
 	// "github.com/jackc/pgproto3/v2"
 )
 
-type PGDB struct {
+// Keeps track of a postgres replication slot that is being consumed and synced
+type PGReplSlot struct {
 	db *sql.DB
 
-	// The name space where we will create sync specific tables (outside user space)
-	CtrlNamespace string
+	// The replication slot we will use to subscribe to change
+	// log events from for this sync
+	ReplSlotName string
 
-	// Name of this sync
-	Name string
+	// The name space where dbsync specific "sync" tables tables will be created.  These will be outside user space.
+	CtrlNamespace string
 
 	// Table where we will write watermarks for this sync
 	WMTableName string
 
 	// Which publication are we tracking with this sync?
 	Publication string
-
-	// The replication slot we will use to subscribe to change
-	// log events from for this sync
-	ReplSlotName string
 
 	relnToPGTableInfo map[uint32]*PGTableInfo
 }
@@ -43,7 +41,7 @@ const DEFAULT_DBSYNC_WM_TABLENAME = "dbsync_wmtable"
 const DEFAULT_DBSYNC_PUBNAME = "dbsync_mypub"
 const DEFAULT_DBSYNC_REPLSLOT = "dbsync_replslot"
 
-func GetEnvOrDefault(envvar string, defaultValue string) string {
+func getEnvOrDefault(envvar string, defaultValue string) string {
 	out := os.Getenv(envvar)
 	if out == "" {
 		out = defaultValue
@@ -51,12 +49,23 @@ func GetEnvOrDefault(envvar string, defaultValue string) string {
 	return out
 }
 
-func PGDBFromEnv() (p *PGDB) {
-	dbname := GetEnvOrDefault("POSTGRES_NAME", DEFAULT_POSTGRES_NAME)
-	dbhost := GetEnvOrDefault("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)
-	dbuser := GetEnvOrDefault("POSTGRES_USER", DEFAULT_POSTGRES_USER)
-	dbpassword := GetEnvOrDefault("POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD)
-	dbport := GetEnvOrDefault("POSTGRES_PORT", DEFAULT_POSTGRES_PORT)
+// Creates a new PGReplSlot instance from parameters obtained from environment variables.
+// The environment variables looked up are:
+//   - POSTGRES_NAME - Name of the Postgres DB to setup replication on
+//   - POSTGRES_HOST - Host where the DB is executing
+//   - POSTGRES_PORT - Port on which the DB is served from
+//   - POSTGRES_USER - Admin username to connect to the postgres db to setup replication on
+//   - POSTGRES_PASSWORD - Password of the admin user
+//   - DBSYNC_CTRL_NAMESPACE - Name of the control namespace where dbsync will creates its auxiliary tables
+//   - DBSYNC_PUBNAME - Name of the publication tracked by dbsync
+//   - DBSYNC_REPLSLOT - Name of the replication slot dbsync will track
+//   - DBSYNC_WM_TABLENAME - Name of the table dbsync will use to create/track watermarks on
+func PGReplSlotFromEnv() (p *PGReplSlot) {
+	dbname := getEnvOrDefault("POSTGRES_NAME", DEFAULT_POSTGRES_NAME)
+	dbhost := getEnvOrDefault("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)
+	dbuser := getEnvOrDefault("POSTGRES_USER", DEFAULT_POSTGRES_USER)
+	dbpassword := getEnvOrDefault("POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD)
+	dbport := getEnvOrDefault("POSTGRES_PORT", DEFAULT_POSTGRES_PORT)
 	portval, err := strconv.Atoi(dbport)
 	if err != nil {
 		panic(err)
@@ -67,11 +76,11 @@ func PGDBFromEnv() (p *PGDB) {
 		panic(err)
 	}
 
-	ctrl_namespace := GetEnvOrDefault("DBSYNC_CTRL_NAMESPACE", DEFAULT_DBSYNC_CTRL_NAMESPACE)
-	wm_table_name := GetEnvOrDefault("DBSYNC_WM_TABLENAME", DEFAULT_DBSYNC_WM_TABLENAME)
-	pubname := GetEnvOrDefault("DBSYNC_PUBNAME", DEFAULT_DBSYNC_PUBNAME)
-	replslot := GetEnvOrDefault("DBSYNC_REPLSLOT", DEFAULT_DBSYNC_REPLSLOT)
-	p = &PGDB{
+	ctrl_namespace := getEnvOrDefault("DBSYNC_CTRL_NAMESPACE", DEFAULT_DBSYNC_CTRL_NAMESPACE)
+	wm_table_name := getEnvOrDefault("DBSYNC_WM_TABLENAME", DEFAULT_DBSYNC_WM_TABLENAME)
+	pubname := getEnvOrDefault("DBSYNC_PUBNAME", DEFAULT_DBSYNC_PUBNAME)
+	replslot := getEnvOrDefault("DBSYNC_REPLSLOT", DEFAULT_DBSYNC_REPLSLOT)
+	p = &PGReplSlot{
 		CtrlNamespace: ctrl_namespace,
 		WMTableName:   wm_table_name,
 		Publication:   pubname,
@@ -85,7 +94,7 @@ func PGDBFromEnv() (p *PGDB) {
 	return
 }
 
-func (p *PGDB) GetTableInfo(relationID uint32) *PGTableInfo {
+func (p *PGReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
 	if p.relnToPGTableInfo == nil {
 		p.relnToPGTableInfo = make(map[uint32]*PGTableInfo)
 	}
@@ -103,7 +112,7 @@ func (p *PGDB) GetTableInfo(relationID uint32) *PGTableInfo {
 /**
  * Queries the DB for the latest schema of a given relation and stores it
  */
-func (p *PGDB) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
+func (p *PGReplSlot) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
 	field_info_query := fmt.Sprintf(`SELECT table_schema, table_name, column_name, ordinal_position, data_type, table_catalog from information_schema.columns WHERE table_schema = '%s' and table_name = '%s' ;`, namespace, table_name)
 	log.Println("Query for field types: ", field_info_query)
 	rows, err := p.db.Query(field_info_query)
@@ -133,7 +142,7 @@ func (p *PGDB) RefreshTableInfo(relationID uint32, namespace string, table_name 
 	return
 }
 
-func (p *PGDB) Setup(db *sql.DB) (err error) {
+func (p *PGReplSlot) Setup(db *sql.DB) (err error) {
 	p.db = db
 	err = p.ensureNamespace()
 
@@ -151,11 +160,11 @@ func (p *PGDB) Setup(db *sql.DB) (err error) {
 	return
 }
 
-func (p *PGDB) DB() *sql.DB {
+func (p *PGReplSlot) DB() *sql.DB {
 	return p.db
 }
 
-func (p *PGDB) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
+func (p *PGReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
 	msgs = out
 	changesfuncname := "pg_logical_slot_peek_binary_changes"
 	if consume {
@@ -184,7 +193,7 @@ func (p *PGDB) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []P
 	return
 }
 
-func (p *PGDB) Forward(nummsgs int) error {
+func (p *PGReplSlot) Forward(nummsgs int) error {
 	changesfuncname := "pg_logical_slot_get_binary_changes"
 	q := fmt.Sprintf(`select * from %s('%s', NULL, %d,
 					'publication_names', '%s',
@@ -203,7 +212,7 @@ func (p *PGDB) Forward(nummsgs int) error {
 	return nil
 }
 
-func (p *PGDB) ensureNamespace() (err error) {
+func (p *PGReplSlot) ensureNamespace() (err error) {
 	rows, err := p.db.Query("SELECT * from pg_catalog.pg_namespace where nspname = $1", p.CtrlNamespace)
 	if err != nil {
 		log.Println("SELECT NAMESPACE ERROR: ", err)
@@ -223,7 +232,7 @@ func (p *PGDB) ensureNamespace() (err error) {
 	return nil
 }
 
-func (p *PGDB) ensureWMTable() (err error) {
+func (p *PGReplSlot) ensureWMTable() (err error) {
 	// Check if our WM table exists
 	rows, err := p.db.Query("SELECT relname, relnamespace, reltype FROM pg_catalog.pg_class WHERE relname = $1 AND relkind = 'r'", p.WMTableName)
 	if err != nil {
@@ -248,7 +257,7 @@ func (p *PGDB) ensureWMTable() (err error) {
 	return nil
 }
 
-func (p *PGDB) registerWithPublication() error {
+func (p *PGReplSlot) registerWithPublication() error {
 	// Now ensure our WM table is assigned to the publication
 	q := fmt.Sprintf(`select pubname from pg_publication_tables where schemaname = '%s' and tablename = '%s'`, p.CtrlNamespace, p.WMTableName)
 	rows, err := p.db.Query(q)
@@ -286,7 +295,7 @@ func (p *PGDB) registerWithPublication() error {
  * Create our replication slots and prepare it to be ready for peek/geting events
  * from our publication.  If a slot already exists, then ensures it is a pgoutput type
  */
-func (p *PGDB) setupReplicationSlots() error {
+func (p *PGReplSlot) setupReplicationSlots() error {
 	q := fmt.Sprintf(`SELECT slot_name, plugin, slot_type, restart_lsn, confirmed_flush_lsn
 			FROM pg_replication_slots
 			WHERE slot_name = '%s'`, p.ReplSlotName)
