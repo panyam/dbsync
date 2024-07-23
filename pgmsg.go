@@ -10,26 +10,42 @@ import (
 
 var ErrStopProcessingMessages = errors.New("message processing halted")
 
+// Type of the callback function to handle messages read (peeked) from replication slot before the offset is forwarded.
+// The callback accepts the list of messages (at the head of the replication slot) and returns two outputs:
+//   - numProcessed - The number of messages processed.  The poller then forwards the slot's by this amount (instead of how many it originally peeked).
+//   - stop - A bool variable that signals to the poller if it should stop processing any further messages from the replication slot.
+type EventsProcessor func([]PGMSG, error) (numProcessed int, stop bool)
+
+type Batcher interface {
+	BatchUpsert(doctype string, docs map[string]StringMap) (any, error)
+	BatchDelete(doctype string, docids []string) (any, error)
+}
+
+type MessageHandler interface {
+	LastCommit() int
+	HandleMessage(i int, rawmsg *PGMSG) error
+}
+
 type PGMSG struct {
 	LSN  string
 	Xid  uint64
 	Data []byte
 }
 
-type PGMSGHandler struct {
-	LastBegin             int
-	LastCommit            int
-	DB                    *ReplSlot
-	HandleBeginMessage    func(m *PGMSGHandler, idx int, msg *pglogrepl.BeginMessage) error
-	HandleCommitMessage   func(m *PGMSGHandler, idx int, msg *pglogrepl.CommitMessage) error
-	HandleRelationMessage func(m *PGMSGHandler, idx int, msg *pglogrepl.RelationMessage, tableInfo *PGTableInfo) error
-	HandleUpdateMessage   func(m *PGMSGHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error
-	HandleDeleteMessage   func(m *PGMSGHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error
-	HandleInsertMessage   func(m *PGMSGHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error
+type DefaultMessageHandler struct {
+	lastBegin             int
+	lastCommit            int
+	DB                    *DBSync
+	HandleBeginMessage    func(m *DefaultMessageHandler, idx int, msg *pglogrepl.BeginMessage) error
+	HandleCommitMessage   func(m *DefaultMessageHandler, idx int, msg *pglogrepl.CommitMessage) error
+	HandleRelationMessage func(m *DefaultMessageHandler, idx int, msg *pglogrepl.RelationMessage, tableInfo *PGTableInfo) error
+	HandleUpdateMessage   func(m *DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error
+	HandleDeleteMessage   func(m *DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error
+	HandleInsertMessage   func(m *DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error
 	relnCache             map[uint32]*pglogrepl.RelationMessage
 }
 
-func (p *PGMSGHandler) UpdateRelation(reln *pglogrepl.RelationMessage) *PGTableInfo {
+func (p *DefaultMessageHandler) UpdateRelation(reln *pglogrepl.RelationMessage) *PGTableInfo {
 	if p.relnCache == nil {
 		p.relnCache = make(map[uint32]*pglogrepl.RelationMessage)
 	}
@@ -48,7 +64,7 @@ func (p *PGMSGHandler) UpdateRelation(reln *pglogrepl.RelationMessage) *PGTableI
 	*/
 }
 
-func (p *PGMSGHandler) GetRelation(relationId uint32) *pglogrepl.RelationMessage {
+func (p *DefaultMessageHandler) GetRelation(relationId uint32) *pglogrepl.RelationMessage {
 	if p.relnCache == nil {
 		p.relnCache = make(map[uint32]*pglogrepl.RelationMessage)
 	}
@@ -59,11 +75,11 @@ func (p *PGMSGHandler) GetRelation(relationId uint32) *pglogrepl.RelationMessage
 	return reln
 }
 
-func (p *PGMSGHandler) HandleMessage(idx int, rawmsg *PGMSG) (err error) {
+func (p *DefaultMessageHandler) HandleMessage(idx int, rawmsg *PGMSG) (err error) {
 	msgtype := rawmsg.Data[0]
 	switch msgtype {
 	case 'B':
-		p.LastBegin = idx
+		p.lastBegin = idx
 		if p.HandleBeginMessage != nil {
 			var msg pglogrepl.BeginMessage
 			msg.Decode(rawmsg.Data[1:])
@@ -72,7 +88,7 @@ func (p *PGMSGHandler) HandleMessage(idx int, rawmsg *PGMSG) (err error) {
 			// log.Println("Begin Transaction: ", rawmsg)
 		}
 	case 'C':
-		p.LastCommit = idx
+		p.lastCommit = idx
 		if p.HandleCommitMessage != nil {
 			var msg pglogrepl.CommitMessage
 			msg.Decode(rawmsg.Data[1:])
@@ -116,35 +132,6 @@ func (p *PGMSGHandler) HandleMessage(idx int, rawmsg *PGMSG) (err error) {
 	return nil
 }
 
-func MessageToMap(p *ReplSlot, msg *pglogrepl.TupleData, reln *pglogrepl.RelationMessage) (pkey string, out map[string]any, errors map[string]error) {
-	msgcols := msg.Columns
-	relcols := reln.Columns
-	if len(msgcols) != len(relcols) {
-		log.Printf("Msg cols (%d) and Rel cols (%d) dont match", len(msgcols), len(relcols))
-	}
-	// fullschema := fmt.Sprintf("%s.%s", reln.Namespace, reln.RelationName)
-	// log.Printf("Namespace: %s, RelName: %s, FullSchema: %s", reln.Namespace, reln.RelationName, fullschema)
-	pkey = "id"
-	if out == nil {
-		out = make(map[string]any)
-	}
-	tableinfo := p.GetTableInfo(reln.RelationID)
-	for i, col := range reln.Columns {
-		val := msgcols[i]
-		colinfo := tableinfo.ColInfo[col.Name]
-		// log.Println("Cols: ", i, col.Name, val, colinfo)
-		var err error
-		if val.DataType == pglogrepl.TupleDataTypeText {
-			out[col.Name], err = colinfo.DecodeText(val.Data)
-		} else if val.DataType == pglogrepl.TupleDataTypeBinary {
-			out[col.Name], err = colinfo.DecodeBytes(val.Data)
-		}
-		if err != nil {
-			if errors == nil {
-				errors = make(map[string]error)
-			}
-			errors[col.Name] = err
-		}
-	}
-	return
+func (p *DefaultMessageHandler) LastCommit() int {
+	return p.lastCommit
 }
