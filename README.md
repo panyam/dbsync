@@ -41,8 +41,6 @@ While the above setup is intuitive there are a few consistency and timeliness ch
 
 Thankfully [DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b) offers a very elegant and incremental solution to the above problem.   Briefly the DBLog idea uses a low and high watermark based approach to capture the full state of a databse while interleaving events in the transaction log.   By doing so the imact on the source database is minimized.  Briefly the basic idea is:
 
-<img src="https://buildmage.com/static/images/part9/current-search-architecture.svg" />
-
 * The reader is updated so it can be requested to "pause" and "resume" its polling of the replication slot and processing of the events.
 * The reader is first paused to initiate a "snapshot" of a subset of records (this size can be chosen based on load constraints).
 * When the reader is in "paused" state, it is requested to "select" a set of records.  For these records the database already has the freshest values so the intent is that the reader is to process the latest values for these records.  After this selection, the output is guaranteed to have the freshest valeus for the records selected in this set.
@@ -51,75 +49,72 @@ Thankfully [DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-captu
 
 From the paper, this process looks like:
 
-## Basic Example
+<img src="https://raw.githubusercontent.com/panyam/dbsync/main/static/images/dblog.png"/>
 
-### Prerequisites
+## DBSync
 
-* You have postgres running.
-* Make sure your postgres instance's wal_level is set to "logical" (in the postgresql.conf file)
-* The following environment variables (corresponding to your database instance) are set:
+This go module is a simple implementation of DBLog.   Under the hood it does the following:
+
+* Creates a "control namespace" in the postgresql db being synced.
+* In this control namespace, it creates a Watermark table which will be used to induce low/high water mark events in our replication slot.
+* Looks for an already created publication for the tables that the user is interested in tracking - this MUST be done by the user/owner of the database.  For example if the user is interested in tracking tables `users`, `restaurants`, `friends`, then a publication must for these tables must be created with the command (where `our_pub_name` is the name of the publication dbsync will be tracking):
+
+```sql
+CREATE PUBLICATION <our_pub_name> FOR TABLE users, restaurants, friends ;
+```
+
+* Takes the above publication (`our_pub_name`) and adds the watermark table to it.  This ensures that changes to the watermark table **along with** the changes to the `users`, `restaurants` and `friends` tables are all serialized to this publication in the order in which the writes were made (to the respective tables).
+* Once the publication is amended, a replication slot is created (if it does not exist).  This replication slot will be ready by the reader/poller going forward.
+
+## Getting Started
+
+Before writing/starting your reader, we want to make sure the following are set:
+
+### Ensure postgres
+
+Make sure you have postgres running and that its wal_level is set to "logical" (in the postgresql.conf file)
+
+### Setup environment variables
+
+The following environment variables (corresponding to your database instance) are set:
   - POSTGRES_NAME - Name of the Postgres DB to setup replication on
   - POSTGRES_HOST - Host where the DB is executing
   - POSTGRES_PORT - Port on which the DB is served from
   - POSTGRES_USER - Admin username to connect to the postgres db to setup replication on
   - POSTGRES_PASSWORD - Password of the admin user
+  - DEFAULT_DBSYNC_CTRL_NAMESPACE - Sets the name of the control namespace where the watermark table is created.  Defaults to `dbsync_ctrl`.
+  - DEFAULT_DBSYNC_WM_TABLENAME - Sets the name of the watermark table which will induce low/high watermkark events in our replication slot.  Defaults to `dbsync_wmtable`.
+  - DEFAULT_DBSYNC_PUBNAME - Name of the publication that will be altered to add the watermark table to.  This MUST be created by the user/admin of the database for the tables they are interested in syncing.  Defaults to `dbsync_mypub`.
+  - DEFAULT_DBSYNC_REPLSLOT - Name of the replication slot that will be created (over the publication).  Defaults to `dbsync_replslot`.
 
-### Start postgres
+### Start the reader
 
-The default database on postgres is `postgres`.  We will use this for our example.
+The reader comes in 2 modes:
 
-POSTGRES_NAME=postgres
+1. Single event mode: In this mode each event is processed individually as they come and the slot offset is forwarded as soon as a message is processed.
+2. Batch mode - Here a batch of messages are first read from the queue, processed and then offset is forwarded (by upto the number of messages read).
 
-### Create source tables
+To start the reader simply:
 
-We will create a couple of source tables which we will continually sync and track their changes on.  In our example we have 3 tables:
-
-#### Users table
-
-This captures information about a user in our system.
-
-```sql
-CREATE TABLE Users (
-    id SERIAL PRIMARY KEY,
-    first_name VARCHAR(255) NOT NULL,
-    user_name VARCHAR(255) NOT NULL,
-    email VARCHAR(255) NOT NULL UNIQUE,
-    avatar VARCHAR(255),
-    homepage VARCHAR(255),
-    date_of_birth DATE,
-    address TEXT,
-    interests TEXT[]
-);
-```
- 
-#### Restaurant table
-
-This captures information about a restaurant that our users will visit and leave ratings on
-
-```sql
-CREATE TABLE Restaurant (
-    id VARCHAR(255) PRIMARY KEY,
-    name VARCHAR(255) NOT NULL,
-    description TEXT,
-    address TEXT,
-    rating INT,
-    tags TEXT[]
-);
+```go
+func main() {
+  // Assuming you have created the publication over the tables to be tracked
+  repllsot := dbsync.ReplSlotFromEnv()
+  
+  reader := dbsync.NewSimpleReader(replslot)
+  
+  select <- {}
+}
 ```
 
-#### Visit table
+## Examples
 
-This captures information about a user's particular visit to a restaurant.
+### Processing one message at a time
 
-```sql
-CREATE TABLE Visit (
-    user_id INT REFERENCES Users(id),
-    restaurant_id VARCHAR(255) REFERENCES Restaurant(id),
-    amount_spent DECIMAL(10, 2) NOT NULL,
-    visit_rating INT,
-    PRIMARY KEY (user_id, restaurant_id)
-);
-```
+### Processing messages in batches
+
+### Inducing a partial snapshot
+
 
 ### Setup our synd pipeline
 

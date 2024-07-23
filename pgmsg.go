@@ -19,7 +19,7 @@ type PGMSG struct {
 type PGMSGHandler struct {
 	LastBegin             int
 	LastCommit            int
-	DB                    *PGReplSlot
+	DB                    *ReplSlot
 	HandleBeginMessage    func(m *PGMSGHandler, idx int, msg *pglogrepl.BeginMessage) error
 	HandleCommitMessage   func(m *PGMSGHandler, idx int, msg *pglogrepl.CommitMessage) error
 	HandleRelationMessage func(m *PGMSGHandler, idx int, msg *pglogrepl.RelationMessage, tableInfo *PGTableInfo) error
@@ -116,7 +116,7 @@ func (p *PGMSGHandler) HandleMessage(idx int, rawmsg *PGMSG) (err error) {
 	return nil
 }
 
-func MessageToMap(p *PGReplSlot, msg *pglogrepl.TupleData, reln *pglogrepl.RelationMessage) (pkey string, out map[string]any, errors map[string]error) {
+func MessageToMap(p *ReplSlot, msg *pglogrepl.TupleData, reln *pglogrepl.RelationMessage) (pkey string, out map[string]any, errors map[string]error) {
 	msgcols := msg.Columns
 	relcols := reln.Columns
 	if len(msgcols) != len(relcols) {

@@ -15,13 +15,13 @@ type Selection interface {
 	// Gets all items currently remaining in the selection
 	// TODO - Should we allow iteration on this in case we
 	// are ok to have a *really* large dataset as part of this
-	Items() map[interface{}]DBItem
+	Items() map[any]DBItem
 
 	// Get the value of an item in this selection given its key.
-	GetItem(key interface{}) (value interface{}, exists bool)
+	GetItem(key any) (value any, exists bool)
 
 	// Removes an item from this collection
-	RemoveItem(key interface{}) interface{}
+	RemoveItem(key any) any
 
 	// Clears all items from this selection to release any storage needed
 	Clear() bool

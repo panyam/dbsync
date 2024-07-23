@@ -46,7 +46,7 @@ type PGSlotPoller struct {
 	// A channel letting us know how many items are to be committed
 	commitReqChan chan int
 
-	pgrs *PGReplSlot
+	pgrs *ReplSlot
 
 	isRunning bool
 	cmdChan   chan cmd
@@ -54,7 +54,7 @@ type PGSlotPoller struct {
 }
 
 // Creates a new slot poller for a given postgres DB.
-func NewPGSlotPoller(pgrs *PGReplSlot, callback LogEventCallbackFunc) *PGSlotPoller {
+func NewPGSlotPoller(pgrs *ReplSlot, callback LogEventCallbackFunc) *PGSlotPoller {
 	out := &PGSlotPoller{
 		Callback:                  callback,
 		pgrs:                      pgrs,

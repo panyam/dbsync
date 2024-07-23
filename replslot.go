@@ -11,7 +11,7 @@ import (
 )
 
 // Keeps track of a postgres replication slot that is being consumed and synced
-type PGReplSlot struct {
+type ReplSlot struct {
 	db *sql.DB
 
 	// The replication slot we will use to subscribe to change
@@ -49,7 +49,7 @@ func getEnvOrDefault(envvar string, defaultValue string) string {
 	return out
 }
 
-// Creates a new PGReplSlot instance from parameters obtained from environment variables.
+// Creates a new ReplSlot instance from parameters obtained from environment variables.
 // The environment variables looked up are:
 //   - POSTGRES_NAME - Name of the Postgres DB to setup replication on
 //   - POSTGRES_HOST - Host where the DB is executing
@@ -60,7 +60,7 @@ func getEnvOrDefault(envvar string, defaultValue string) string {
 //   - DBSYNC_PUBNAME - Name of the publication tracked by dbsync
 //   - DBSYNC_REPLSLOT - Name of the replication slot dbsync will track
 //   - DBSYNC_WM_TABLENAME - Name of the table dbsync will use to create/track watermarks on
-func PGReplSlotFromEnv() (p *PGReplSlot) {
+func ReplSlotFromEnv() (p *ReplSlot) {
 	dbname := getEnvOrDefault("POSTGRES_NAME", DEFAULT_POSTGRES_NAME)
 	dbhost := getEnvOrDefault("POSTGRES_HOST", DEFAULT_POSTGRES_HOST)
 	dbuser := getEnvOrDefault("POSTGRES_USER", DEFAULT_POSTGRES_USER)
@@ -80,7 +80,7 @@ func PGReplSlotFromEnv() (p *PGReplSlot) {
 	wm_table_name := getEnvOrDefault("DBSYNC_WM_TABLENAME", DEFAULT_DBSYNC_WM_TABLENAME)
 	pubname := getEnvOrDefault("DBSYNC_PUBNAME", DEFAULT_DBSYNC_PUBNAME)
 	replslot := getEnvOrDefault("DBSYNC_REPLSLOT", DEFAULT_DBSYNC_REPLSLOT)
-	p = &PGReplSlot{
+	p = &ReplSlot{
 		CtrlNamespace: ctrl_namespace,
 		WMTableName:   wm_table_name,
 		Publication:   pubname,
@@ -95,7 +95,7 @@ func PGReplSlotFromEnv() (p *PGReplSlot) {
 }
 
 // Returns the info about a table given its relation ID
-func (p *PGReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
+func (p *ReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
 	if p.relnToPGTableInfo == nil {
 		p.relnToPGTableInfo = make(map[uint32]*PGTableInfo)
 	}
@@ -111,7 +111,7 @@ func (p *PGReplSlot) GetTableInfo(relationID uint32) *PGTableInfo {
 }
 
 // Queries the DB for the latest schema of a given relation and stores it
-func (p *PGReplSlot) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
+func (p *ReplSlot) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
 	field_info_query := fmt.Sprintf(`SELECT table_schema, table_name, column_name, ordinal_position, data_type, table_catalog from information_schema.columns WHERE table_schema = '%s' and table_name = '%s' ;`, namespace, table_name)
 	log.Println("Query for field types: ", field_info_query)
 	rows, err := p.db.Query(field_info_query)
@@ -142,7 +142,7 @@ func (p *PGReplSlot) RefreshTableInfo(relationID uint32, namespace string, table
 }
 
 // Sets up the replication slot with our auxiliary namespace, watermark table, publications and replication slots
-func (p *PGReplSlot) setup(db *sql.DB) (err error) {
+func (p *ReplSlot) setup(db *sql.DB) (err error) {
 	p.db = db
 	err = p.ensureNamespace()
 
@@ -161,13 +161,13 @@ func (p *PGReplSlot) setup(db *sql.DB) (err error) {
 }
 
 // Returns the underlying sql.DB instance being tracked
-func (p *PGReplSlot) DB() *sql.DB {
+func (p *ReplSlot) DB() *sql.DB {
 	return p.db
 }
 
 // Returns numMessages number of events at the front of the replication slot (queue).  If consume parameter is set, then the offset
 // is automatically forwarded, otherwise repeated calls to this method will simply returned "peeked" messages.
-func (p *PGReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
+func (p *ReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
 	msgs = out
 	changesfuncname := "pg_logical_slot_peek_binary_changes"
 	if consume {
@@ -197,7 +197,7 @@ func (p *PGReplSlot) GetMessages(numMessages int, consume bool, out []PGMSG) (ms
 }
 
 // Forwards the message offset on the replication slot.  Typically GetMessages is called to peek N messages.  Then after those messages are processed the offset is forwarded to ensure at-least once processing of messages.
-func (p *PGReplSlot) Forward(nummsgs int) error {
+func (p *ReplSlot) Forward(nummsgs int) error {
 	changesfuncname := "pg_logical_slot_get_binary_changes"
 	q := fmt.Sprintf(`select * from %s('%s', NULL, %d,
 					'publication_names', '%s',
@@ -216,7 +216,7 @@ func (p *PGReplSlot) Forward(nummsgs int) error {
 	return nil
 }
 
-func (p *PGReplSlot) ensureNamespace() (err error) {
+func (p *ReplSlot) ensureNamespace() (err error) {
 	rows, err := p.db.Query("SELECT * from pg_catalog.pg_namespace where nspname = $1", p.CtrlNamespace)
 	if err != nil {
 		log.Println("SELECT NAMESPACE ERROR: ", err)
@@ -236,7 +236,7 @@ func (p *PGReplSlot) ensureNamespace() (err error) {
 	return nil
 }
 
-func (p *PGReplSlot) ensureWMTable() (err error) {
+func (p *ReplSlot) ensureWMTable() (err error) {
 	// Check if our WM table exists
 	rows, err := p.db.Query("SELECT relname, relnamespace, reltype FROM pg_catalog.pg_class WHERE relname = $1 AND relkind = 'r'", p.WMTableName)
 	if err != nil {
@@ -261,7 +261,7 @@ func (p *PGReplSlot) ensureWMTable() (err error) {
 	return nil
 }
 
-func (p *PGReplSlot) registerWithPublication() error {
+func (p *ReplSlot) registerWithPublication() error {
 	// Now ensure our WM table is assigned to the publication
 	q := fmt.Sprintf(`select pubname from pg_publication_tables where schemaname = '%s' and tablename = '%s'`, p.CtrlNamespace, p.WMTableName)
 	rows, err := p.db.Query(q)
@@ -299,7 +299,7 @@ func (p *PGReplSlot) registerWithPublication() error {
  * Create our replication slots and prepare it to be ready for peek/geting events
  * from our publication.  If a slot already exists, then ensures it is a pgoutput type
  */
-func (p *PGReplSlot) setupReplicationSlots() error {
+func (p *ReplSlot) setupReplicationSlots() error {
 	q := fmt.Sprintf(`SELECT slot_name, plugin, slot_type, restart_lsn, confirmed_flush_lsn
 			FROM pg_replication_slots
 			WHERE slot_name = '%s'`, p.ReplSlotName)
