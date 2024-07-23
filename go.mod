@@ -4,7 +4,7 @@ go 1.22
 
 toolchain go1.22.4
 
-replace github.com/panyam/goutils v0.1.1 => ../goutils/
+// replace github.com/panyam/goutils v0.1.1 => ../goutils/
 
 require (
 	github.com/jackc/pglogrepl v0.0.0-20240307033717-828fbfe908e9
