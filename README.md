@@ -77,7 +77,7 @@ Make sure you have postgres running and that its wal_level is set to "logical" (
 ### Setup environment variables
 
 The following environment variables (corresponding to your database instance) are set:
-  - POSTGRES_NAME - Name of the Postgres DB to setup replication on
+  - POSTGRES_DB - Name of the Postgres DB to setup replication on
   - POSTGRES_HOST - Host where the DB is executing
   - POSTGRES_PORT - Port on which the DB is served from
   - POSTGRES_USER - Admin username to connect to the postgres db to setup replication on

@@ -112,6 +112,7 @@ func NewDBSync(opts ...DBSyncOpt) (d *DBSync, err error) {
 	// Load a default DB if one not found
 	if d.db == nil {
 		dbconnstr := PGConnStringFromEnv()
+		log.Println("Connecting to db: ", dbconnstr)
 		d.db, err = sql.Open("postgres", dbconnstr)
 	}
 
@@ -512,7 +513,7 @@ func (d *DBSync) processBatchMessages(msgs []PGMSG, err error) (numProcessed int
 	}
 
 	// Reset this stuff
-	d.upserts = make(map[string]map[string]gfn.StringMap)
+	d.upserts = make(map[string]map[string]StringMap)
 	d.deletions = make(map[string]map[string]bool)
 	if d.MessageHandler.LastCommit() > 0 {
 		return d.MessageHandler.LastCommit() + 1, false

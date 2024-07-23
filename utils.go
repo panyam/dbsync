@@ -17,7 +17,7 @@ func ConnStr(DBName string, Host string, Port int, Username string, Password str
 func PGConnStringFromEnv() string {
 	out := gut.GetEnvOrDefault("POSTGRES_CONNSTR", "", false)
 	if out == "" {
-		dbname := gut.GetEnvOrDefault("POSTGRES_NAME", DEFAULT_POSTGRES_NAME, true)
+		dbname := gut.GetEnvOrDefault("POSTGRES_DB", DEFAULT_POSTGRES_DB)
 		dbhost := gut.GetEnvOrDefault("POSTGRES_HOST", DEFAULT_POSTGRES_HOST, true)
 		dbuser := gut.GetEnvOrDefault("POSTGRES_USER", DEFAULT_POSTGRES_USER, true)
 		dbpassword := gut.GetEnvOrDefault("POSTGRES_PASSWORD", DEFAULT_POSTGRES_PASSWORD, true)

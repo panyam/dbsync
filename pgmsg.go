@@ -17,7 +17,7 @@ var ErrStopProcessingMessages = errors.New("message processing halted")
 type EventsProcessor func([]PGMSG, error) (numProcessed int, stop bool)
 
 type Batcher interface {
-	BatchUpsert(doctype string, docs map[string]StringMap) (any, error)
+	BatchUpsert(doctype string, docs []StringMap) (any, error)
 	BatchDelete(doctype string, docids []string) (any, error)
 }
 

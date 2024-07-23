@@ -1,7 +1,7 @@
 package dbsync
 
 const DEFAULT_POSTGRES_HOST = "localhost"
-const DEFAULT_POSTGRES_NAME = "postgres"
+const DEFAULT_POSTGRES_DB = "postgres"
 const DEFAULT_POSTGRES_USER = "postgres"
 const DEFAULT_POSTGRES_PASSWORD = "docker"
 const DEFAULT_POSTGRES_PORT = "5432"
