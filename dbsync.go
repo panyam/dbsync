@@ -18,9 +18,8 @@ type StringMap = map[string]any
 
 // Our main DBSync type keeps track of a postgres replication slot that is being consumed and synced
 type DBSync struct {
-	EventsProcessor EventsProcessor
-	MessageHandler  MessageHandler
-	Batcher         Batcher
+	MessageHandler MessageHandler
+	Batcher        Batcher
 
 	// The poller peeks for messages in the replication slot periodically.  This determines delay between peeks.
 	DelayBetweenPeekRetries time.Duration
@@ -173,7 +172,7 @@ func (d *DBSync) Start() {
 		case <-readTimer.C:
 			msgs, err := d.GetMessages(d.MaxMessagesToRead, false, nil)
 			if err != nil {
-				d.EventsProcessor(nil, err)
+				d.processMessagesInBatch(nil, err)
 				return
 			}
 			if len(msgs) == 0 {
@@ -191,7 +190,7 @@ func (d *DBSync) Start() {
 				timerDelay = 0
 
 				// Here we should process the messages so we can tell the DB
-				numProcessed, stop := d.EventsProcessor(msgs, err)
+				numProcessed, stop := d.processMessagesInBatch(msgs, err)
 				err = d.Forward(numProcessed)
 				if err != nil {
 					panic(err)
@@ -475,7 +474,8 @@ func (p *DBSync) setupReplicationSlots() error {
 	return nil
 }
 
-func (d *DBSync) processBatchMessages(msgs []PGMSG, err error) (numProcessed int, stop bool) {
+// Called by dbsyncer to process messages in batch
+func (d *DBSync) processMessagesInBatch(msgs []PGMSG, err error) (numProcessed int, stop bool) {
 	if err != nil {
 		log.Println("Error processing messsages: ", err)
 		return 0, false
