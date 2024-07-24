@@ -121,14 +121,23 @@ func main() {
 	d.MessageHandler = &dbsync.DefaultMessageHandler{
 		HandleInsertMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
 			log.Println("Handling Insert Message: ", idx, msg, reln)
+      
+      // ... process a record creation - eg create the record in the secondary index
+      
 			return nil
 		},
 		HandleDeleteMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error {
 			log.Println("Handling Delete Message: ", idx, msg, reln)
+      
+      // ... process a record deletion - eg delete from a secondary index
+      
 			return nil
 		},
 		HandleUpdateMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
 			log.Println("Handling Updated Message: ", idx, msg, reln)
+      
+      // ... process a record update - eg write to a secondary index
+      
 			return nil
     },
   }
@@ -137,6 +146,100 @@ func main() {
 ```
 
 ### Batch processing messages with event compaction
+
+Consider the case where in a short period of time as messages are read from the replication slot most updates are for a small set of frequent keys, eg:
+
+```
+1. Update K1
+2. Delete K1
+3. Create K1
+4. Update K2
+5. Update K2
+6. Update K2
+7. Insert K3
+8. Delete K2
+9. Insert K2
+10. Delete K1
+```
+
+In this scenario, if messages were processed one at a time so that they are replicated to another store we would need a total of 10 writes (on the target datastore).   Instead these messages can be compacted so that only the final state of the affected records are written in one go.    This ensures that a key's final state is recorded instead of all its intermediate states.  For example after doing 4 writes on key K1, its finally deleted.
+
+DBSync provides a few primitives to ensure that events are compacted and writes are minimized via batching.
+
+1. `MarkAsUpdated` and `MarkAsDeleted` methods that can be called by the message handler (on DBSync) to so that the final state of a key is actively tracked.
+2. `Batcher` interface to perform batch updates and batch deletions on a collection of records
+ 
+Using this our example is now:
+
+```go
+func main() {
+  // Assuming you have created the publication over the tables to be tracked
+	d, err := dbsync.NewDBSync()
+	if err != nil {
+		panic(err)
+	}
+	d.MessageHandler = &dbsync.DefaultMessageHandler{
+		HandleInsertMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Insert Message: ", idx, msg, reln)
+      recordType := // Get record type for message
+      recordId := // Get ID for the record
+      recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
+                     // this value would be the document format appropriate for the key value store
+      d.MarkAsUpdated(recordType, recordId, recordValue)
+			return nil
+		},
+		HandleDeleteMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Delete Message: ", idx, msg, reln)
+      
+      recordType := // Get record type for message
+      recordId := // Get ID for the record
+      
+      d.MarkAsDeleted(recordType, recordId)
+			return nil
+		},
+		HandleUpdateMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Updated Message: ", idx, msg, reln)
+      recordType := // Get record type for message
+      recordId := // Get ID for the record
+      recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
+                     // this value would be the document format appropriate for the key value store
+      
+      d.MarkAsUpdated(recordType, recordId, recordValue)
+			return nil
+    },
+  }
+  d.Batcher = &EchoBatcher{}
+  d.Start()
+}
+```
+
+Unlike the individual message processing example, here the record type, ID and values are extracted from the change capture event and prepared/converted to a format suitable to the target store (eg if records are to be replicated into elastic, then recordValue will be the final document that elastic might accept).  Similary when messages are deleted, all deleted records are collected for a batch deletion later on.
+
+This brings us to the Batched writes.   DBSync can accept a `Batcher` instance of the type:
+
+```go
+type Batcher interface {
+	BatchUpsert(doctype string, docs []map[string]any) (any, error)
+	BatchDelete(doctype string, docids []string) (any, error)
+}
+```
+
+Once the processing of events is done, the Batcher can be used to upsert documents that were marked for udpates and delete documents marked for deletions in one fell swoop.  Our Batcher implementation could simply be one that writes the collected documents to stdout:
+
+```
+type EchoBatcher struct {}
+
+func (e *EchoBatcher) BatchUpsert(doctype string, docs []map[string]any) (any, error) {
+  log.Println("Upserting items for doctype: ", doctype)
+  for k,_ := range docs {
+    log.Println("Updating document with id: ", k)
+  }
+}
+
+func (e *EchoBatcher) BatchDelete(doctype string, docids []string) (any, error) {
+  log.Println("Deleting items for doctype: ", doctype, docids)
+}
+```
 
 ### Inducing partial snapshots
 
