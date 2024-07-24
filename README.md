@@ -135,3 +135,11 @@ func main() {
   d.Start()
 }
 ```
+
+### Batch processing messages with event compaction
+
+TODO
+
+### Inducing partial snapshots
+
+TODO
