@@ -512,7 +512,7 @@ func (d *DBSync) processBatchMessages(msgs []PGMSG, err error) (numProcessed int
 		}
 	}
 
-	// Reset this stuff
+	// Reset the batch collections
 	d.upserts = make(map[string]map[string]StringMap)
 	d.deletions = make(map[string]map[string]bool)
 	if d.MessageHandler.LastCommit() > 0 {

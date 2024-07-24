@@ -100,7 +100,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	d.MessageHandler = &dbsync.EchoHandler{}
+	d.MessageHandler = &dbsync.EchoMessageHandler{}
   d.Start()
 }
 ```
