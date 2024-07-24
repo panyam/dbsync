@@ -87,41 +87,51 @@ The following environment variables (corresponding to your database instance) ar
   - DEFAULT_DBSYNC_PUBNAME - Name of the publication that will be altered to add the watermark table to.  This MUST be created by the user/admin of the database for the tables they are interested in syncing.  Defaults to `dbsync_mypub`.
   - DEFAULT_DBSYNC_REPLSLOT - Name of the replication slot that will be created (over the publication).  Defaults to `dbsync_replslot`.
 
-### Start the reader
+## Examples
 
-The reader comes in 2 modes:
+### Simple change logger
 
-1. Single event mode: In this mode each event is processed individually as they come and the slot offset is forwarded as soon as a message is processed.
-2. Batch mode - Here a batch of messages are first read from the queue, processed and then offset is forwarded (by upto the number of messages read).
-
-To start the reader simply:
+In our basic example we simply log changes to the stdout:
 
 ```go
 func main() {
   // Assuming you have created the publication over the tables to be tracked
-  repllsot := dbsync.ReplSlotFromEnv()
-  
-  reader := dbsync.NewSimpleReader(replslot)
-  
-  select <- {}
+	d, err := dbsync.NewDBSync()
+	if err != nil {
+		panic(err)
+	}
+	d.MessageHandler = &dbsync.EchoHandler{}
+  d.Start()
 }
 ```
 
-## Examples
+Start your postgres db (with defaults), and as you update tables (selected for event publication) you will see the events printed on stdout.
 
-### Processing one message at a time
+### Custom message processing based on event type
 
-### Processing messages in batches
+Instead of printing every message, we can treat each message type in a custom manner.   The `DefaultMessageHandler` type allows custom function pointers that can be overridden for each message type.  If we want to handle only selected message types (eg Inserted, Deleted, Updated events) we can specify just these functions to the DefaultMessageHandler:
 
-### Inducing a partial snapshot
-
-
-### Setup our synd pipeline
-
-Open example.go and start the main method:
-
-
-
-References
-* dblog paper from netflix
-* Dolt - https://www.dolthub.com/blog/2024-03-08-postgres-logical-replication/
+```go
+func main() {
+  // Assuming you have created the publication over the tables to be tracked
+	d, err := dbsync.NewDBSync()
+	if err != nil {
+		panic(err)
+	}
+	d.MessageHandler = &dbsync.DefaultMessageHandler{
+		HandleInsertMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Insert Message: ", idx, msg, reln)
+			return nil
+		},
+		HandleDeleteMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Delete Message: ", idx, msg, reln)
+			return nil
+		},
+		HandleUpdateMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
+			log.Println("Handling Updated Message: ", idx, msg, reln)
+			return nil
+    },
+  }
+  d.Start()
+}
+```

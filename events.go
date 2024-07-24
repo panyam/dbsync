@@ -1,7 +1,6 @@
 package dbsync
 
-import "time"
-
+/*
 const (
 	SYNC_SESSION_CREATED   = 0
 	SYNC_SESSION_STARTED   = 1
@@ -40,3 +39,4 @@ type DBItem struct {
 func (e *DBLogEvent) IsWatermark() bool {
 	return e.Type == EVENT_TYPE_WATERMARK
 }
+*/
