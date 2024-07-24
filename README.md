@@ -243,4 +243,13 @@ func (e *EchoBatcher) BatchDelete(doctype string, docids []string) (any, error) 
 
 ### Inducing partial snapshots
 
-TODO
+So far we have been on the happy path where - the replication slots were setup before any writes were incurred on the tables being monitored.   However from time to time forcing a reload of certain keys (or key ranges) is needed - if nothing else then to simply refresh them.   Simply loading the records with keys (of interest) wont do.  Because while selecting the records and processing them, there could be other writes to these entities that may be missed or be out-of-band resulting in inconsistent data.  Here is where the original DBLog idea shines.   Please do read it and understand it.  The details wont be covered here, only our interface providing the functionality.
+
+
+In order to perform a partial reload/refresh of data, DBSync exposes a "Refresh" method:
+
+```
+func (d *DBSync) Refresh(selectQuery string) 
+```
+
+This method performs the record selection and performs the heart of the DBLog algorithm by performing non-stale reads and using low/high watermarks to bound this selection.  This ensures that entries matched by the `selectQuery` (a SELECT statement with filters) are processed in a consistent freshness preserving manner.
