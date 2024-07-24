@@ -1,5 +1,10 @@
 package dbsync
 
+type DBItem struct {
+	Key  any
+	Data any
+}
+
 type Selection interface {
 	// ID of the this selection
 	Id() string

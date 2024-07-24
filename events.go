@@ -18,8 +18,8 @@ const (
 type WaterMark = string
 
 type Row interface {
-	Key() interface{}
-	Data() interface{}
+	Key() any
+	Data() any
 }
 
 type DBLogEvent struct {
@@ -27,13 +27,8 @@ type DBLogEvent struct {
 	LSN       string
 	Timestamp time.Time
 	Source    string
-	Key       interface{}
-	Data      interface{}
-}
-
-type DBItem struct {
-	Key  interface{}
-	Data interface{}
+	Key       any
+	Data      any
 }
 
 func (e *DBLogEvent) IsWatermark() bool {
