@@ -13,6 +13,9 @@ const PG_TIMESTAMP_FORMAT = "2006-01-02 15:04:05.999999+00"
 
 type PGTableInfo struct {
 	RelationID uint32
+	DBName     string
+	Namespace  string
+	TableName  string
 	ColInfo    map[string]*PGColumnInfo
 }
 

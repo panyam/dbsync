@@ -269,8 +269,10 @@ func (p *Syncer) RefreshTableInfo(relationID uint32, namespace string, table_nam
 		if err := rows.Scan(&col.Namespace, &col.TableName, &col.ColumnName, &col.OrdinalPosition, &col.ColumnType, &col.DBName); err != nil {
 			log.Println("Could not scan row: ", err)
 		} else {
-			if colinfo, ok := tableInfo.ColInfo[col.ColumnName]; !ok {
+			colinfo, ok := tableInfo.ColInfo[col.ColumnName]
+			if !ok {
 				tableInfo.ColInfo[col.ColumnName] = &col
+				colinfo = &col
 			} else {
 				colinfo.DBName = col.DBName
 				colinfo.Namespace = col.Namespace
@@ -278,6 +280,21 @@ func (p *Syncer) RefreshTableInfo(relationID uint32, namespace string, table_nam
 				colinfo.ColumnName = col.ColumnName
 				colinfo.ColumnType = col.ColumnType
 				colinfo.OrdinalPosition = col.OrdinalPosition
+			}
+			if tableInfo.DBName == "" {
+				tableInfo.DBName = colinfo.DBName
+			} else if tableInfo.DBName != colinfo.DBName {
+				log.Printf("DBName mismatch: %s != %s", tableInfo.DBName, colinfo.DBName)
+			}
+			if tableInfo.Namespace == "" {
+				tableInfo.Namespace = colinfo.Namespace
+			} else if tableInfo.Namespace != colinfo.Namespace {
+				log.Printf("Namespace mismatch: %s != %s", tableInfo.Namespace, colinfo.Namespace)
+			}
+			if tableInfo.TableName == "" {
+				tableInfo.TableName = colinfo.TableName
+			} else if tableInfo.TableName != colinfo.TableName {
+				log.Printf("TableName mismatch: %s != %s", tableInfo.TableName, colinfo.TableName)
 			}
 		}
 	}
@@ -590,7 +607,7 @@ func (d *Syncer) processRefreshQuery(selectQuery string) {
 		return
 	}
 
-	highWmQuery := fmt.Sprintf(`INSERT INTO %s.%s (selectionid, wm_type) VALUES (?, 'high')`, d.ctrlNamespace, d.wmTableName)
+	highWmQuery := fmt.Sprintf(`UPDATE %s.%s SET wm_type = 'high' WHERE selectionid = ?`, d.ctrlNamespace, d.wmTableName)
 	_, err = d.db.Exec(highWmQuery, d.currSelection.ID())
 	if err != nil {
 		log.Println("Error creating high water mark: ", err)
@@ -702,7 +719,7 @@ func (d *Syncer) processMessage(idx int, rawmsg *PGMSG) (err error) {
 		tableinfo := d.GetTableInfo(reln.RelationID)
 		// check for low watermark message - Note this can move around dependign on how we chose to create the watermarks
 		// - ie whether as inserts, updates or deletes etc
-		if false {
+		if tableinfo.Namespace == d.ctrlNamespace && tableinfo.TableName == d.wmTableName {
 			if d.currSelection == nil {
 				log.Println("Selection is nil - water marks are useless")
 			} else {
@@ -721,7 +738,7 @@ func (d *Syncer) processMessage(idx int, rawmsg *PGMSG) (err error) {
 		tableinfo := d.GetTableInfo(reln.RelationID)
 		// check for high watermark message - Note this can move around dependign on how we chose to create the watermarks
 		// - ie whether as inserts, updates or deletes etc
-		if false {
+		if tableinfo.Namespace == d.ctrlNamespace && tableinfo.TableName == d.wmTableName {
 			// we have a selection we are good to go
 			d.enteredWatermark = false
 
