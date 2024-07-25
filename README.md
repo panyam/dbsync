@@ -1,5 +1,5 @@
 
-# DBSync
+# Syncer
 
 A simple change data capture (CDC) processing library for postgres based on [DBLog](https://netflixtechblog.com/dblog-a-generic-change-data-capture-framework-69351fb9099b).
 
@@ -51,7 +51,7 @@ From the paper, this process looks like:
 
 <img src="https://raw.githubusercontent.com/panyam/dbsync/main/static/images/dblog.png"/>
 
-## DBSync
+## Syncer
 
 This go module is a simple implementation of DBLog.   Under the hood it does the following:
 
@@ -96,7 +96,7 @@ In our basic example we simply log changes to the stdout:
 ```go
 func main() {
   // Assuming you have created the publication over the tables to be tracked
-	d, err := dbsync.NewDBSync()
+	d, err := dbsync.NewSyncer()
 	if err != nil {
 		panic(err)
 	}
@@ -109,39 +109,50 @@ Start your postgres db (with defaults), and as you update tables (selected for e
 
 ### Custom message processing based on event type
 
-Instead of printing every message, we can treat each message type in a custom manner.   The `DefaultMessageHandler` type allows custom function pointers that can be overridden for each message type.  If we want to handle only selected message types (eg Inserted, Deleted, Updated events) we can specify just these functions to the DefaultMessageHandler:
+Instead of printing every message, we can treat each message type in a custom manner.   Since `DefaultMessageHandler` has a no-op for all of the MessageHandler methods, it can be included in our custom handler - the `OurMessageHandler`, while only overriding messages we are interested in:
 
 ```go
+
+
 func main() {
   // Assuming you have created the publication over the tables to be tracked
-	d, err := dbsync.NewDBSync()
+	d, err := dbsync.NewSyncer()
 	if err != nil {
 		panic(err)
 	}
-	d.MessageHandler = &dbsync.DefaultMessageHandler{
-		HandleInsertMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Insert Message: ", idx, msg, reln)
-      
-      // ... process a record creation - eg create the record in the secondary index
-      
-			return nil
-		},
-		HandleDeleteMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Delete Message: ", idx, msg, reln)
-      
-      // ... process a record deletion - eg delete from a secondary index
-      
-			return nil
-		},
-		HandleUpdateMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Updated Message: ", idx, msg, reln)
-      
-      // ... process a record update - eg write to a secondary index
-      
-			return nil
-    },
-  }
+	d.MessageHandler = &OurMessageHandler{}
   d.Start()
+}
+
+type OurMessageHandler struct {
+  dbsync.DefaultMessageHandler
+}
+
+// Specialized insert message handler
+func (h *OurMessageHandler) HandleInsertMessage(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
+  log.Println("Handling Insert Message: ", idx, msg, reln)
+  
+  // ... process a record creation - eg create the record in the secondary index
+  
+  return nil
+}
+
+// Specialized delete message handler
+func (h *OurMessageHandler) HandleDeleteMessage(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage, tableInfo *PGTableInfo) error {
+  log.Println("Handling Delete Message: ", idx, msg, reln)
+  
+  // ... process a record deletion - eg delete from a secondary index
+  
+  return nil
+}
+
+// Specialized update message handler
+func (h *OurMessageHandler) HandleUpdateMessage(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
+  log.Println("Handling Updated Message: ", idx, msg, reln)
+  
+  // ... process a record update - eg write to a secondary index
+  
+  return nil
 }
 ```
 
@@ -164,9 +175,9 @@ Consider the case where in a short period of time as messages are read from the 
 
 In this scenario, if messages were processed one at a time so that they are replicated to another store we would need a total of 10 writes (on the target datastore).   Instead these messages can be compacted so that only the final state of the affected records are written in one go.    This ensures that a key's final state is recorded instead of all its intermediate states.  For example after doing 4 writes on key K1, its finally deleted.
 
-DBSync provides a few primitives to ensure that events are compacted and writes are minimized via batching.
+Syncer provides a few primitives to ensure that events are compacted and writes are minimized via batching.
 
-1. `MarkAsUpdated` and `MarkAsDeleted` methods that can be called by the message handler (on DBSync) to so that the final state of a key is actively tracked.
+1. `MarkAsUpdated` and `MarkAsDeleted` methods that can be called by the message handler (on Syncer) to so that the final state of a key is actively tracked.
 2. `Batcher` interface to perform batch updates and batch deletions on a collection of records
  
 Using this our example is now:
@@ -174,48 +185,53 @@ Using this our example is now:
 ```go
 func main() {
   // Assuming you have created the publication over the tables to be tracked
-	d, err := dbsync.NewDBSync()
+	d, err := dbsync.NewSyncer()
 	if err != nil {
 		panic(err)
 	}
-	d.MessageHandler = &dbsync.DefaultMessageHandler{
-		HandleInsertMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Insert Message: ", idx, msg, reln)
-      recordType := // Get record type for message
-      recordId := // Get ID for the record
-      recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
-                     // this value would be the document format appropriate for the key value store
-      d.MarkAsUpdated(recordType, recordId, recordValue)
-			return nil
-		},
-		HandleDeleteMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Delete Message: ", idx, msg, reln)
-      
-      recordType := // Get record type for message
-      recordId := // Get ID for the record
-      
-      d.MarkAsDeleted(recordType, recordId)
-			return nil
-		},
-		HandleUpdateMessage: func(m *dbsync.DefaultMessageHandler, idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
-			log.Println("Handling Updated Message: ", idx, msg, reln)
-      recordType := // Get record type for message
-      recordId := // Get ID for the record
-      recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
-                     // this value would be the document format appropriate for the key value store
-      
-      d.MarkAsUpdated(recordType, recordId, recordValue)
-			return nil
-    },
-  }
+	d.MessageHandler = &OurMessageHandler{ds: d}
   d.Batcher = &EchoBatcher{}
   d.Start()
+}
+
+type OurMessageHandler struct {
+  dbsync.DefaultMessageHandler
+  ds *Syncer
+}
+  
+func (d *OurMessageHandler) HandleInsertMessage(idx int, msg *pglogrepl.InsertMessage, reln *pglogrepl.RelationMessage) error {
+  log.Println("Handling Insert Message: ", idx, msg, reln)
+  recordType := // Get record type for message
+  recordId := // Get ID for the record
+  recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
+                 // this value would be the document format appropriate for the key value store
+  d.ds.MarkAsUpdated(recordType, recordId, recordValue)
+  return nil
+}
+func (d *OurMessageHandler) HandleDeleteMessage(idx int, msg *pglogrepl.DeleteMessage, reln *pglogrepl.RelationMessage, tableInfo *PGTableInfo) error {
+  log.Println("Handling Delete Message: ", idx, msg, reln)
+  
+  recordType := // Get record type for message
+  recordId := // Get ID for the record
+  
+  d.ds.MarkAsDeleted(recordType, recordId)
+  return nil
+}
+func (d *OurMessageHandler) HandleUpdateMessage(idx int, msg *pglogrepl.UpdateMessage, reln *pglogrepl.RelationMessage) error {
+  log.Println("Handling Updated Message: ", idx, msg, reln)
+  recordType := // Get record type for message
+  recordId := // Get ID for the record
+  recordValue := // compute record's value to be passed to our batcher - for example if we are writing to a key/value store, 
+                 // this value would be the document format appropriate for the key value store
+  
+  d.ds.MarkAsUpdated(recordType, recordId, recordValue)
+  return nil
 }
 ```
 
 Unlike the individual message processing example, here the record type, ID and values are extracted from the change capture event and prepared/converted to a format suitable to the target store (eg if records are to be replicated into elastic, then recordValue will be the final document that elastic might accept).  Similary when messages are deleted, all deleted records are collected for a batch deletion later on.
 
-This brings us to the Batched writes.   DBSync can accept a `Batcher` instance of the type:
+This brings us to the Batched writes.   Syncer can accept a `Batcher` instance of the type:
 
 ```go
 type Batcher interface {
@@ -246,10 +262,10 @@ func (e *EchoBatcher) BatchDelete(doctype string, docids []string) (any, error) 
 So far we have been on the happy path where - the replication slots were setup before any writes were incurred on the tables being monitored.   However from time to time forcing a reload of certain keys (or key ranges) is needed - if nothing else then to simply refresh them.   Simply loading the records with keys (of interest) wont do.  Because while selecting the records and processing them, there could be other writes to these entities that may be missed or be out-of-band resulting in inconsistent data.  Here is where the original DBLog idea shines.   Please do read it and understand it.  The details wont be covered here, only our interface providing the functionality.
 
 
-In order to perform a partial reload/refresh of data, DBSync exposes a "Refresh" method:
+In order to perform a partial reload/refresh of data, Syncer exposes a "Refresh" method:
 
 ```
-func (d *DBSync) Refresh(selectQuery string) 
+func (d *Syncer) Refresh(selectQuery string) 
 ```
 
 This method performs the record selection and performs the heart of the DBLog algorithm by performing non-stale reads and using low/high watermarks to bound this selection.  This ensures that entries matched by the `selectQuery` (a SELECT statement with filters) are processed in a consistent freshness preserving manner.

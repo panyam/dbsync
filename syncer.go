@@ -10,14 +10,33 @@ import (
 	"time"
 
 	// "github.com/jackc/pgproto3/v2"
+	"github.com/jackc/pglogrepl"
 	gfn "github.com/panyam/goutils/fn"
 	gut "github.com/panyam/goutils/utils"
 )
 
 type StringMap = map[string]any
 
-// Our main DBSync type keeps track of a postgres replication slot that is being consumed and synced
-type DBSync struct {
+type selection interface {
+	ID() string
+
+	// Gets all items currently remaining in the selection
+	// TODO - Should we allow iteration on this in case we
+	// are ok to have a *really* large dataset as part of this
+	Items() map[any]DBItem
+
+	// Get the value of an item in this selection given its key.
+	GetItem(key any) (value any, exists bool)
+
+	// Removes an item from this collection
+	RemoveItem(key any) any
+
+	// Clears all items from this selection to release any storage needed
+	Clear() bool
+}
+
+// Our main Syncer type keeps track of a postgres replication slot that is being consumed and synced
+type Syncer struct {
 	MessageHandler MessageHandler
 	Batcher        Batcher
 
@@ -52,12 +71,19 @@ type DBSync struct {
 
 	relnToPGTableInfo map[uint32]*PGTableInfo
 
-	selChan chan Selection
+	refreshChan      chan string
+	currSelection    selection
+	enteredWatermark bool
 
 	tableNames []string
 
 	// A channel letting us know how many items are to be committed
 	commitReqChan chan int
+
+	// Marks when the last begin and last commit messages were
+	lastBegin  int
+	lastCommit int
+	relnCache  map[uint32]*pglogrepl.RelationMessage
 
 	upserts   map[string](map[string]StringMap)
 	deletions map[string](map[string]bool)
@@ -69,7 +95,7 @@ type DBSync struct {
 
 type cmd struct{ Name string }
 
-// Creates a new DBSync instance from parameters obtained from environment variables.
+// Creates a new Syncer instance from parameters obtained from environment variables.
 // The environment variables looked up are:
 //   - POSTGRES_NAME - Name of the Postgres DB to setup replication on
 //   - POSTGRES_HOST - Host where the DB is executing
@@ -80,14 +106,14 @@ type cmd struct{ Name string }
 //   - DBSYNC_PUBNAME - Name of the publication tracked by dbsync
 //   - DBSYNC_REPLSLOT - Name of the replication slot dbsync will track
 //   - DBSYNC_WM_TABLENAME - Name of the table dbsync will use to create/track watermarks on
-func NewDBSync(opts ...DBSyncOpt) (d *DBSync, err error) {
-	d = &DBSync{
+func NewSyncer(opts ...SyncerOpt) (d *Syncer, err error) {
+	d = &Syncer{
 		TimerDelayBackoffFactor:   1.5,
 		DelayBetweenPeekRetries:   100 * time.Millisecond,
 		MaxDelayBetweenEmptyPeeks: 60 * time.Second,
 		MaxMessagesToRead:         8192,
 	}
-	d.selChan = make(chan Selection)
+	d.refreshChan = make(chan string)
 	for _, opt := range opts {
 		err = opt(d)
 		if err != nil {
@@ -123,22 +149,36 @@ func NewDBSync(opts ...DBSyncOpt) (d *DBSync, err error) {
 }
 
 // Tells if the poller is running or stopped.
-func (d *DBSync) IsRunning() bool {
+func (d *Syncer) IsRunning() bool {
 	return d.isRunning
 }
 
 // Signals to the poller to stop consuming messages from the replication slot
-func (d *DBSync) Stop() {
+func (d *Syncer) Stop() {
 	d.cmdChan <- cmd{Name: "stop"}
 	d.wg.Wait()
 }
 
-func (d *DBSync) Start() {
+// Kicks off a refresh of the records returned given by the select query.
+func (d *Syncer) Refresh(selectQuery string) bool {
+	// write the Low water mark into the wm table
+	if d.currSelection != nil {
+		log.Println("In the middle of another selection.  Try again when this is complete")
+		return false
+	}
+	d.currSelection = NewInMemSelection()
+
+	d.refreshChan <- selectQuery
+	return true
+}
+
+// Starts the syncer loop
+func (d *Syncer) Start() {
 	if d.isRunning {
 		return
 	}
 	d.isRunning = true
-	log.Println("DBSync Started")
+	log.Println("Syncer Started")
 	d.wg.Add(1)
 	d.commitReqChan = make(chan int)
 	timerDelay := 0 * time.Second
@@ -151,12 +191,12 @@ func (d *DBSync) Start() {
 		}
 		d.commitReqChan = nil
 		d.wg.Done()
-		log.Println("DBSync Stopped")
+		log.Println("Syncer Stopped")
 	}()
 	for {
 		select {
-		case selReq := <-d.selChan:
-			selReq.Execute()
+		case selectQuery := <-d.refreshChan:
+			d.processRefreshQuery(selectQuery)
 			// Now get all the entries from this selection and
 			// process them first
 			break
@@ -170,27 +210,20 @@ func (d *DBSync) Start() {
 				log.Println("Invalid command: ", cmd)
 			}
 		case <-readTimer.C:
+			// TODO - Should we cache what is read so that we dont repeat reads where offset is only forwarded partially?
 			msgs, err := d.GetMessages(d.MaxMessagesToRead, false, nil)
 			if err != nil {
-				d.processMessagesInBatch(nil, err)
+				log.Println("Error processing messsages: ", err)
 				return
 			}
 			if len(msgs) == 0 {
 				// Nothing found - try again after a delay
-				slog.Debug("Timer delay: ", "timerDelay", timerDelay)
-				if timerDelay == 0 {
-					timerDelay += d.DelayBetweenPeekRetries
-				} else {
-					timerDelay = (3 * timerDelay) / 2
-				}
-				if timerDelay > d.MaxDelayBetweenEmptyPeeks {
-					timerDelay = d.MaxDelayBetweenEmptyPeeks
-				}
+				timerDelay = d.incrementTimerDelay(timerDelay)
 			} else {
 				timerDelay = 0
 
 				// Here we should process the messages so we can tell the DB
-				numProcessed, stop := d.processMessagesInBatch(msgs, err)
+				numProcessed, stop := d.processMessages(msgs, err)
 				err = d.Forward(numProcessed)
 				if err != nil {
 					panic(err)
@@ -205,7 +238,7 @@ func (d *DBSync) Start() {
 }
 
 // Returns the info about a table given its relation ID
-func (p *DBSync) GetTableInfo(relationID uint32) *PGTableInfo {
+func (p *Syncer) GetTableInfo(relationID uint32) *PGTableInfo {
 	if p.relnToPGTableInfo == nil {
 		p.relnToPGTableInfo = make(map[uint32]*PGTableInfo)
 	}
@@ -221,7 +254,7 @@ func (p *DBSync) GetTableInfo(relationID uint32) *PGTableInfo {
 }
 
 // Queries the DB for the latest schema of a given relation and stores it
-func (p *DBSync) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
+func (p *Syncer) RefreshTableInfo(relationID uint32, namespace string, table_name string) (tableInfo *PGTableInfo, err error) {
 	field_info_query := fmt.Sprintf(`SELECT table_schema, table_name, column_name, ordinal_position, data_type, table_catalog from information_schema.columns WHERE table_schema = '%s' and table_name = '%s' ;`, namespace, table_name)
 	log.Println("Query for field types: ", field_info_query)
 	rows, err := p.db.Query(field_info_query)
@@ -251,40 +284,19 @@ func (p *DBSync) RefreshTableInfo(relationID uint32, namespace string, table_nam
 	return
 }
 
-// Sets up the replication slot with our auxiliary namespace, watermark table, publications and replication slots
-func (d *DBSync) setup() (err error) {
-	if d.db == nil {
-		log.Fatal("DB is not setup")
-	}
-	err = d.ensureNamespace()
-
-	if err == nil {
-		err = d.ensurewmTable()
-	}
-
-	if err == nil {
-		err = d.registerWithPublication()
-	}
-
-	if err == nil {
-		err = d.setupReplicationSlots()
-	}
-	return
-}
-
 // Returns the underlying sql.DB instance being tracked
-func (p *DBSync) DB() *sql.DB {
+func (p *Syncer) DB() *sql.DB {
 	return p.db
 }
 
-func (d *DBSync) MarkUpdated(doctype string, docid string, doc StringMap) {
+func (d *Syncer) MarkUpdated(doctype string, docid string, doc StringMap) {
 	d.upserts[doctype][docid] = doc
 	if d.deletions[doctype] != nil && d.deletions[doctype][docid] {
 		d.deletions[doctype][docid] = false
 	}
 }
 
-func (d *DBSync) MarkDeleted(doctype string, docid string) {
+func (d *Syncer) MarkDeleted(doctype string, docid string) {
 	if d.upserts[doctype] != nil && d.upserts[doctype][docid] != nil {
 		delete(d.upserts[doctype], docid)
 	}
@@ -296,7 +308,7 @@ func (d *DBSync) MarkDeleted(doctype string, docid string) {
 
 // Returns numMessages number of events at the front of the replication slot (queue).  If consume parameter is set, then the offset
 // is automatically forwarded, otherwise repeated calls to this method will simply returned "peeked" messages.
-func (p *DBSync) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
+func (p *Syncer) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs []PGMSG, err error) {
 	msgs = out
 	changesfuncname := "pg_logical_slot_peek_binary_changes"
 	if consume {
@@ -326,7 +338,7 @@ func (p *DBSync) GetMessages(numMessages int, consume bool, out []PGMSG) (msgs [
 }
 
 // Forwards the message offset on the replication slot.  Typically GetMessages is called to peek N messages.  Then after those messages are processed the offset is forwarded to ensure at-least once processing of messages.
-func (p *DBSync) Forward(nummsgs int) error {
+func (p *Syncer) Forward(nummsgs int) error {
 	changesfuncname := "pg_logical_slot_get_binary_changes"
 	q := fmt.Sprintf(`select * from %s('%s', NULL, %d,
 					'publication_names', '%s',
@@ -345,7 +357,89 @@ func (p *DBSync) Forward(nummsgs int) error {
 	return nil
 }
 
-func (p *DBSync) ensureNamespace() (err error) {
+func (d *Syncer) UpdateRelation(reln *pglogrepl.RelationMessage) *PGTableInfo {
+	if d.relnCache == nil {
+		d.relnCache = make(map[uint32]*pglogrepl.RelationMessage)
+	}
+	d.relnCache[reln.RelationID] = reln
+
+	// Query to get info on pkeys
+	tableInfo, _ := d.RefreshTableInfo(reln.RelationID, reln.Namespace, reln.RelationName)
+	return tableInfo
+
+	/*
+			getpkeyquer := fmt.Sprintf(`SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS data_type
+								FROM   pg_index i
+								JOIN   pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY(i.indkey)
+								WHERE  i.indrelid = 'tablename'::regclass AND i.indisprimary`, reln.Namespace, reln.RelationName)
+		log.Println("Query for pkey: ", getpkeyquer)
+	*/
+}
+
+func (d *Syncer) GetRelation(relationId uint32) *pglogrepl.RelationMessage {
+	if d.relnCache == nil {
+		d.relnCache = make(map[uint32]*pglogrepl.RelationMessage)
+	}
+	reln, ok := d.relnCache[relationId]
+	if !ok {
+		panic("Could not find relation - Need to query DB manually")
+	}
+	return reln
+}
+
+func (s *Syncer) MessageToMap(msg *pglogrepl.TupleData, reln *pglogrepl.RelationMessage) (pkey string, out map[string]any, errors map[string]error) {
+	msgcols := msg.Columns
+	relcols := reln.Columns
+	if len(msgcols) != len(relcols) {
+		log.Printf("Msg cols (%d) and Rel cols (%d) dont match", len(msgcols), len(relcols))
+	}
+	// fullschema := fmt.Sprintf("%s.%s", reln.Namespace, reln.RelationName)
+	// log.Printf("Namespace: %s, RelName: %s, FullSchema: %s", reln.Namespace, reln.RelationName, fullschema)
+	pkey = "id"
+	out = make(map[string]any)
+	tableinfo := s.GetTableInfo(reln.RelationID)
+	for i, col := range reln.Columns {
+		val := msgcols[i]
+		colinfo := tableinfo.ColInfo[col.Name]
+		// log.Println("Cols: ", i, col.Name, val, colinfo)
+		var err error
+		if val.DataType == pglogrepl.TupleDataTypeText {
+			out[col.Name], err = colinfo.DecodeText(val.Data)
+		} else if val.DataType == pglogrepl.TupleDataTypeBinary {
+			out[col.Name], err = colinfo.DecodeBytes(val.Data)
+		}
+		if err != nil {
+			if errors == nil {
+				errors = make(map[string]error)
+			}
+			errors[col.Name] = err
+		}
+	}
+	return
+}
+
+// Sets up the replication slot with our auxiliary namespace, watermark table, publications and replication slots
+func (d *Syncer) setup() (err error) {
+	if d.db == nil {
+		log.Fatal("DB is not setup")
+	}
+	err = d.ensureNamespace()
+
+	if err == nil {
+		err = d.ensurewmTable()
+	}
+
+	if err == nil {
+		err = d.registerWithPublication()
+	}
+
+	if err == nil {
+		err = d.setupReplicationSlots()
+	}
+	return
+}
+
+func (p *Syncer) ensureNamespace() (err error) {
 	rows, err := p.db.Query("SELECT * from pg_catalog.pg_namespace where nspname = $1", p.ctrlNamespace)
 	if err != nil {
 		log.Println("SELECT NAMESPACE ERROR: ", err)
@@ -365,7 +459,7 @@ func (p *DBSync) ensureNamespace() (err error) {
 	return nil
 }
 
-func (p *DBSync) ensurewmTable() (err error) {
+func (p *Syncer) ensurewmTable() (err error) {
 	// Check if our WM table exists
 	rows, err := p.db.Query("SELECT relname, relnamespace, reltype FROM pg_catalog.pg_class WHERE relname = $1 AND relkind = 'r'", p.wmTableName)
 	if err != nil {
@@ -377,8 +471,7 @@ func (p *DBSync) ensurewmTable() (err error) {
 		// create this table
 		create_wmtable_query := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s.%s (
 				selectionid varchar(50) PRIMARY KEY,
-				low_wm varchar(50),
-				high_wm varchar(50)
+				wm_type varchar(10)
 			)`, p.ctrlNamespace, p.wmTableName)
 		_, err = p.db.Exec(create_wmtable_query)
 		if err != nil {
@@ -390,7 +483,7 @@ func (p *DBSync) ensurewmTable() (err error) {
 	return nil
 }
 
-func (p *DBSync) registerWithPublication() error {
+func (p *Syncer) registerWithPublication() error {
 	// Now ensure our WM table is assigned to the publication
 	q := fmt.Sprintf(`select pubname from pg_publication_tables where schemaname = '%s' and tablename = '%s'`, p.ctrlNamespace, p.wmTableName)
 	rows, err := p.db.Query(q)
@@ -428,7 +521,7 @@ func (p *DBSync) registerWithPublication() error {
  * Create our replication slots and prepare it to be ready for peek/geting events
  * from our publication.  If a slot already exists, then ensures it is a pgoutput type
  */
-func (p *DBSync) setupReplicationSlots() error {
+func (p *Syncer) setupReplicationSlots() error {
 	q := fmt.Sprintf(`SELECT slot_name, plugin, slot_type, restart_lsn, confirmed_flush_lsn
 			FROM pg_replication_slots
 			WHERE slot_name = '%s'`, p.replicationSlot)
@@ -474,14 +567,58 @@ func (p *DBSync) setupReplicationSlots() error {
 	return nil
 }
 
+func (d *Syncer) processRefreshQuery(selectQuery string) {
+	defer func() {
+		d.currSelection = nil
+	}()
+	if d.currSelection == nil {
+		log.Println("Called to process a refresh but selection is not sest.")
+		return
+	}
+
+	lowWmQuery := fmt.Sprintf(`INSERT INTO %s.%s (selectionid, wm_type) VALUES (?, 'low')`, d.ctrlNamespace, d.wmTableName)
+	_, err := d.db.Exec(lowWmQuery, d.currSelection.ID())
+	if err != nil {
+		log.Println("Error creating low water mark: ", err)
+		return
+	}
+
+	// Now perform a selection and set it
+	_, err = d.db.Exec(selectQuery)
+	if err != nil {
+		log.Println("Error executing selection: ", err)
+		return
+	}
+
+	highWmQuery := fmt.Sprintf(`INSERT INTO %s.%s (selectionid, wm_type) VALUES (?, 'high')`, d.ctrlNamespace, d.wmTableName)
+	_, err = d.db.Exec(highWmQuery, d.currSelection.ID())
+	if err != nil {
+		log.Println("Error creating high water mark: ", err)
+		return
+	}
+}
+
+func (d *Syncer) incrementTimerDelay(timerDelay time.Duration) time.Duration {
+	slog.Debug("Timer delay: ", "timerDelay", timerDelay)
+	if timerDelay == 0 {
+		timerDelay += d.DelayBetweenPeekRetries
+	} else {
+		timerDelay = (3 * timerDelay) / 2
+	}
+	if timerDelay > d.MaxDelayBetweenEmptyPeeks {
+		timerDelay = d.MaxDelayBetweenEmptyPeeks
+	}
+	return timerDelay
+}
+
 // Called by dbsyncer to process messages in batch
-func (d *DBSync) processMessagesInBatch(msgs []PGMSG, err error) (numProcessed int, stop bool) {
+func (d *Syncer) processMessages(msgs []PGMSG, err error) (numProcessed int, stop bool) {
 	if err != nil {
 		log.Println("Error processing messsages: ", err)
 		return 0, false
 	}
 	for i, rawmsg := range msgs {
-		err := d.MessageHandler.HandleMessage(i, &rawmsg)
+		err := d.processMessage(i, &rawmsg)
 		// Handle batch deletions
 		if err == ErrStopProcessingMessages {
 			break
@@ -515,9 +652,97 @@ func (d *DBSync) processMessagesInBatch(msgs []PGMSG, err error) (numProcessed i
 	// Reset the batch collections
 	d.upserts = make(map[string]map[string]StringMap)
 	d.deletions = make(map[string]map[string]bool)
-	if d.MessageHandler.LastCommit() > 0 {
-		return d.MessageHandler.LastCommit() + 1, false
+	if d.lastCommit > 0 {
+		return d.lastCommit + 1, false
 	} else {
 		return len(msgs), false
+	}
+}
+
+// Called to process each individual message
+func (d *Syncer) processMessage(idx int, rawmsg *PGMSG) (err error) {
+	msgtype := rawmsg.Data[0]
+	switch msgtype {
+	case 'B':
+		d.lastBegin = idx
+		var msg pglogrepl.BeginMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		return d.MessageHandler.HandleBeginMessage(idx, &msg)
+	case 'C':
+		d.lastCommit = idx
+		var msg pglogrepl.CommitMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		return d.MessageHandler.HandleCommitMessage(idx, &msg)
+	case 'R':
+		var msg pglogrepl.RelationMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		// TODO - Cache this so we arent doing this again and again
+		tableInfo := d.UpdateRelation(&msg)
+		return d.MessageHandler.HandleRelationMessage(idx, &msg, tableInfo)
+	case 'D':
+		var msg pglogrepl.DeleteMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		reln := d.GetRelation(msg.RelationID)
+		tableinfo := d.GetTableInfo(reln.RelationID)
+		return d.MessageHandler.HandleDeleteMessage(idx, &msg, reln, tableinfo)
+	case 'I':
+		var msg pglogrepl.InsertMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		reln := d.GetRelation(msg.RelationID)
+		tableinfo := d.GetTableInfo(reln.RelationID)
+		// check for low watermark message - Note this can move around dependign on how we chose to create the watermarks
+		// - ie whether as inserts, updates or deletes etc
+		if false {
+			if d.currSelection == nil {
+				log.Println("Selection is nil - water marks are useless")
+			} else {
+				d.enteredWatermark = true
+			}
+			return
+		} else {
+			return d.MessageHandler.HandleInsertMessage(idx, &msg, reln, tableinfo)
+		}
+	case 'U':
+		var msg pglogrepl.UpdateMessage
+		if err = msg.Decode(rawmsg.Data[1:]); err != nil {
+			return
+		}
+		reln := d.GetRelation(msg.RelationID)
+		tableinfo := d.GetTableInfo(reln.RelationID)
+		// check for high watermark message - Note this can move around dependign on how we chose to create the watermarks
+		// - ie whether as inserts, updates or deletes etc
+		if false {
+			// we have a selection we are good to go
+			d.enteredWatermark = false
+
+			// We just exited the watermark - so process items in the selection first
+			if d.currSelection != nil {
+				for k, v := range d.currSelection.Items() {
+					err = d.MessageHandler.HandleRefresh(k, v)
+					// Handle batch deletions
+					if err == ErrStopProcessingMessages {
+						break
+					} else if err != nil {
+						log.Println("Error handling message: ", idx, err)
+					}
+				}
+			}
+			return
+		} else {
+			return d.MessageHandler.HandleUpdateMessage(idx, &msg, reln, tableinfo)
+		}
+	default:
+		log.Println(fmt.Sprintf("Processing Messages (%c): ", msgtype), rawmsg)
+		panic(fmt.Errorf("invalid Message Type: %c", msgtype))
 	}
 }

@@ -2,10 +2,8 @@ package dbsync
 
 import (
 	"fmt"
-	"log"
 	"strconv"
 
-	"github.com/jackc/pglogrepl"
 	gut "github.com/panyam/goutils/utils"
 )
 
@@ -29,37 +27,4 @@ func PGConnStringFromEnv() string {
 		out = ConnStr(dbname, dbhost, portval, dbuser, dbpassword)
 	}
 	return out
-}
-
-func MessageToMap(p *DBSync, msg *pglogrepl.TupleData, reln *pglogrepl.RelationMessage) (pkey string, out map[string]any, errors map[string]error) {
-	msgcols := msg.Columns
-	relcols := reln.Columns
-	if len(msgcols) != len(relcols) {
-		log.Printf("Msg cols (%d) and Rel cols (%d) dont match", len(msgcols), len(relcols))
-	}
-	// fullschema := fmt.Sprintf("%s.%s", reln.Namespace, reln.RelationName)
-	// log.Printf("Namespace: %s, RelName: %s, FullSchema: %s", reln.Namespace, reln.RelationName, fullschema)
-	pkey = "id"
-	if out == nil {
-		out = make(map[string]any)
-	}
-	tableinfo := p.GetTableInfo(reln.RelationID)
-	for i, col := range reln.Columns {
-		val := msgcols[i]
-		colinfo := tableinfo.ColInfo[col.Name]
-		// log.Println("Cols: ", i, col.Name, val, colinfo)
-		var err error
-		if val.DataType == pglogrepl.TupleDataTypeText {
-			out[col.Name], err = colinfo.DecodeText(val.Data)
-		} else if val.DataType == pglogrepl.TupleDataTypeBinary {
-			out[col.Name], err = colinfo.DecodeBytes(val.Data)
-		}
-		if err != nil {
-			if errors == nil {
-				errors = make(map[string]error)
-			}
-			errors[col.Name] = err
-		}
-	}
-	return
 }
