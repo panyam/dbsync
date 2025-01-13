@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -522,12 +523,37 @@ func (p *Syncer) registerWithPublication() error {
 		}
 	} else {
 		// our table is not part of the publication so add to it
+		// but first check if the publication already exists
+		q := fmt.Sprintf(`select * from pg_publication_tables where pubname = '%s'`, p.publication)
+		rows2, err := p.db.Query(q)
+		if err != nil {
+			log.Println("Error finding publication: ", err)
+			return err
+		}
+		defer rows2.Close()
+		log.Println("here3", p.tableNames)
+		if !rows2.Next() {
+			if len(p.tableNames) == 0 {
+				createpubsql := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE table1, table2, ..., tableN ;", p.publication)
+				log.Printf("Could not find publication.  Either pass in the tableNames with the ForTables option to auto create it or manually create it with: %s", createpubsql)
+				panic(fmt.Errorf("could not find publication '%s'", p.publication))
+			} else {
+				createpubsql := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE %s ;", p.publication, strings.Join(p.tableNames, ", "))
+				log.Println("Create SQL: ", createpubsql)
+				_, err = p.db.Exec(createpubsql)
+				if err != nil {
+					log.Printf("Could not create publication (%s). %v", p.publication, err)
+					panic(err)
+				}
+			}
+		}
+
 		alterpub := fmt.Sprintf(`ALTER PUBLICATION %s ADD TABLE %s.%s`, p.publication, p.ctrlNamespace, p.wmTableName)
-		_, err := p.db.Exec(alterpub)
+		_, err = p.db.Exec(alterpub)
 		if err != nil {
 			log.Println("ALTER PUBLICATION Error : ", err)
 			createpubsql := fmt.Sprintf("CREATE PUBLICATION %s FOR TABLE table1, table2, ..., tableN ;", p.publication)
-			log.Printf("Did you create the publication?  Try: %s", createpubsql)
+			log.Printf("Could not alter publication (%s).  It may not exist.  Either pass in the tableNames with the ForTables option to auto create it or manually create it with: %s", p.publication, createpubsql)
 			return err
 		}
 	}
